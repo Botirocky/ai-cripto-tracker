@@ -5,6 +5,11 @@ import time
 import shutil
 import subprocess
 import csv
+import html
+import json
+import sqlite3
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 import requests
 import numpy as np
@@ -33,7 +38,7 @@ def configure_cross_platform_stdio():
                 pass
 
 try:
-    from PySide6.QtCore import QTimer, QDateTime
+    from PySide6.QtCore import QTimer, QDateTime, Qt, QTime
     from PySide6.QtWidgets import (
         QApplication,
         QWidget,
@@ -48,7 +53,15 @@ try:
         QInputDialog,
         QTabWidget,
         QCheckBox,
+        QLineEdit,
+        QComboBox,
+        QTableWidget,
+        QTableWidgetItem,
+        QFileDialog,
+        QTimeEdit,
     )
+    from PySide6.QtCharts import QChart, QChartView, QLineSeries, QDateTimeAxis, QValueAxis
+    from PySide6.QtGui import QBrush, QColor, QPainter, QPen
     QT_AVAILABLE = True
     QT_IMPORT_ERROR = None
 except Exception as e:
@@ -100,6 +113,29 @@ ASSETS = {
     "Masterplast": "MASTERPLAST.BD",
     "AKKO Invest": "AKKO.BD",
     "Appeninn": "APPENINN.BD",
+    # További kriptók (Yahoo *-USD)
+    "Stellar": "XLM-USD",
+    "Cosmos": "ATOM-USD",
+    "NEAR Protocol": "NEAR-USD",
+    "Uniswap": "UNI-USD",
+    "Algorand": "ALGO-USD",
+    "Filecoin": "FIL-USD",
+    "Hedera": "HBAR-USD",
+    "VeChain": "VET-USD",
+    "Shiba Inu": "SHIB-USD",
+    "Aptos": "APT-USD",
+    "Arbitrum": "ARB-USD",
+    "Optimism": "OP-USD",
+    # További részvények / blue chip
+    "JPMorgan Chase": "JPM",
+    "Visa": "V",
+    "Coca-Cola": "KO",
+    "SAP": "SAP",
+    "McDonald's": "MCD",
+    "Walt Disney": "DIS",
+    "Spotify": "SPOT",
+    "Berkshire Hathaway": "BRK-B",
+    "Intel": "INTC",
 }
 
 FX_URL = "https://api.exchangerate-api.com/v4/latest/USD"
@@ -109,6 +145,10 @@ REQUEST_TIMEOUT = 15
 YAHOO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; AssetTracker/1.0)",
 }
+
+APP_STATE_DIR = Path.home() / ".config" / "ai-cripto-tracker"
+FAVORITES_PATH = APP_STATE_DIR / "favorites.json"
+CUSTOM_ALERTS_PATH = APP_STATE_DIR / "custom_alerts.json"
 
 
 def http_get(url, timeout=REQUEST_TIMEOUT, headers=None):
@@ -246,11 +286,455 @@ def get_asset(symbol, timeout=REQUEST_TIMEOUT):
     if not quotes:
         raise ValueError(f"Üres idősor: {symbol}")
 
-    prices = quotes[0].get("close") or []
-    prices = np.array([p for p in prices if p is not None], dtype=float)
+    closes = quotes[0].get("close") or []
+    vols = quotes[0].get("volume") or []
+    if len(vols) != len(closes):
+        vols = [None] * len(closes)
+    pc, pv = [], []
+    for c, v in zip(closes, vols):
+        if c is not None:
+            pc.append(float(c))
+            pv.append(float(v) if v is not None else np.nan)
+    prices = np.array(pc, dtype=float)
+    volumes = np.array(pv, dtype=float)
     if prices.size < 2:
         raise ValueError(f"Túl kevés érvényes ár: {symbol}")
-    return prices
+    meta = result.get("meta") or {}
+    native_open_fallback = None
+    if meta.get("regularMarketOpen") is None:
+        native_open_fallback = infer_session_open_native_from_chart(result)
+    return prices, meta, native_open_fallback, volumes
+
+
+def fetch_chart_series(symbol, range_param="1d", interval_param="5m", timeout=REQUEST_TIMEOUT):
+    """
+    Yahoo chart idősor (záró árak + időbélyegek) diagramhoz.
+    range_param: 1d, 5d, 1mo, 3mo, 6mo, 1y
+    interval_param: 1m, 2m, 5m, 15m, 1h, 1d (Yahoo által támogatott kombinációk)
+    """
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?range={range_param}&interval={interval_param}"
+    )
+    r = http_get(url, timeout=timeout, headers=YAHOO_HEADERS)
+    r.raise_for_status()
+    data = r.json()
+    chart = data.get("chart") or {}
+    if chart.get("error") or not chart.get("result"):
+        raise ValueError(f"Nincs diagram adat: {symbol}")
+    result = chart["result"][0]
+    ts = result.get("timestamp") or []
+    quotes = (result.get("indicators") or {}).get("quote") or []
+    if not quotes:
+        raise ValueError(f"Üres idősor: {symbol}")
+    closes = quotes[0].get("close") or []
+    points = []
+    for t, c in zip(ts, closes):
+        if c is not None and t is not None:
+            points.append((int(t) * 1000, float(c)))
+    if len(points) < 2:
+        raise ValueError(f"Túl kevés diagram pont: {symbol}")
+    meta = result.get("meta") or {}
+    native_open_fb = None
+    if meta.get("regularMarketOpen") is None:
+        native_open_fb = infer_session_open_native_from_chart(result)
+    return {
+        "points": points,
+        "meta": meta,
+        "native_open_fallback": native_open_fb,
+    }
+
+
+def regular_market_change_pct(meta):
+    """Százalékos változás a meta mezők alapján (ha elérhető)."""
+    if not meta:
+        return None
+    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    price = meta.get("regularMarketPrice")
+    try:
+        if prev is None or price is None:
+            return None
+        p, pr = float(price), float(prev)
+        if pr == 0:
+            return None
+        return (p / pr - 1.0) * 100.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _utc_date_from_ts(tsec):
+    return datetime.fromtimestamp(int(tsec), tz=timezone.utc).date()
+
+
+def infer_session_open_native_from_chart(chart_result):
+    """
+    Ha a meta-ban nincs regularMarketOpen: az idősor utolsó napjának első ismert open értéke (Yahoo pénznem).
+    """
+    ts = chart_result.get("timestamp") or []
+    quotes = (chart_result.get("indicators") or {}).get("quote") or []
+    if not quotes or not ts:
+        return None
+    opens = quotes[0].get("open") or []
+    if len(opens) != len(ts):
+        return None
+    i = len(ts) - 1
+    while i >= 0 and opens[i] is None:
+        i -= 1
+    if i < 0:
+        return None
+    last_day = _utc_date_from_ts(ts[i])
+    first_i = i
+    j = i - 1
+    while j >= 0:
+        if opens[j] is None:
+            j -= 1
+            continue
+        if _utc_date_from_ts(ts[j]) != last_day:
+            break
+        first_i = j
+        j -= 1
+    o = opens[first_i]
+    try:
+        return float(o) if o is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def meta_session_open_previous_close(meta, multiplier, native_open_fallback=None):
+    """
+    Részvény / instrumentum session nyitás és előző záró (Yahoo meta), megjelenítési devizában.
+    - regularMarketOpen: aktuális (mai) piaci session nyitás
+    - chartPreviousClose vagy previousClose: előző záró (napi változás bázisa)
+    Ha a nyitás hiányzik a meta-ból, lehet native_open_fallback (Yahoo ár, még nem szorozva mult-tal).
+    """
+    if not meta and native_open_fallback is None:
+        return None, None
+    mult = float(multiplier) if multiplier not in (None, 0) else 1.0
+    raw_open = (meta or {}).get("regularMarketOpen")
+    raw_prev = (meta or {}).get("chartPreviousClose") or (meta or {}).get("previousClose")
+    try:
+        o = float(raw_open) * mult if raw_open is not None else None
+        if o is None and native_open_fallback is not None:
+            o = float(native_open_fallback) * mult
+        pc = float(raw_prev) * mult if raw_prev is not None else None
+        return o, pc
+    except (TypeError, ValueError):
+        return None, None
+
+
+# ---- ÁLLAPOT (kedvencek, riasztások, SQLite) ----
+def ensure_app_state_dir():
+    APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_favorites():
+    ensure_app_state_dir()
+    if not FAVORITES_PATH.is_file():
+        return []
+    try:
+        data = json.loads(FAVORITES_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(x) for x in data if x in ASSETS]
+    except (OSError, ValueError, TypeError):
+        pass
+    return []
+
+
+def save_favorites(names):
+    ensure_app_state_dir()
+    FAVORITES_PATH.write_text(json.dumps(sorted(set(names)), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_custom_alert_rules():
+    ensure_app_state_dir()
+    if not CUSTOM_ALERTS_PATH.is_file():
+        return []
+    try:
+        data = json.loads(CUSTOM_ALERTS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return []
+
+
+def save_custom_alert_rules(rules):
+    ensure_app_state_dir()
+    CUSTOM_ALERTS_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def db_conn():
+    ensure_app_state_dir()
+    p = APP_STATE_DIR / "history.sqlite3"
+    conn = sqlite3.connect(str(p))
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS analysis_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, asset TEXT, currency TEXT,
+        current REAL, future REAL, decision TEXT,
+        rsi REAL, next_up_prob REAL, accuracy REAL,
+        macd_hist REAL, vol_ann REAL, max_dd REAL
+    )"""
+    )
+    conn.commit()
+    return conn
+
+
+def db_insert_rows(rows):
+    if not rows:
+        return
+    conn = db_conn()
+    try:
+        conn.executemany(
+            """INSERT INTO analysis_log
+            (ts, asset, currency, current, future, decision, rsi, next_up_prob, accuracy, macd_hist, vol_ann, max_dd)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_search_history(asset_needle="", limit=500):
+    conn = db_conn()
+    try:
+        if asset_needle.strip():
+            cur = conn.execute(
+                """SELECT ts, asset, currency, current, future, decision, rsi, next_up_prob, accuracy
+                FROM analysis_log WHERE asset LIKE ? ORDER BY id DESC LIMIT ?""",
+                (f"%{asset_needle.strip()}%", int(limit)),
+            )
+        else:
+            cur = conn.execute(
+                """SELECT ts, asset, currency, current, future, decision, rsi, next_up_prob, accuracy
+                FROM analysis_log ORDER BY id DESC LIMIT ?""",
+                (int(limit),),
+            )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+# ---- TOVÁBBI INDIKÁTOROK / KOCKÁZAT ----
+def ema_np(x, span):
+    if x.size == 0:
+        return x
+    alpha = 2.0 / (span + 1)
+    y = np.empty_like(x, dtype=float)
+    y[0] = x[0]
+    for i in range(1, x.size):
+        y[i] = alpha * x[i] + (1.0 - alpha) * y[i - 1]
+    return y
+
+
+def macd_bundle(prices):
+    if prices.size < 40:
+        return None, None, None
+    ema12 = ema_np(prices, 12)
+    ema26 = ema_np(prices, 26)
+    line = ema12 - ema26
+    signal = ema_np(line, 9)
+    hist = line - signal
+    return float(line[-1]), float(signal[-1]), float(hist[-1])
+
+
+def bollinger_last(prices, window=20, n_std=2.0):
+    if prices.size < window:
+        return None, None, None
+    w = prices[-window:]
+    mid = float(np.mean(w))
+    sd = float(np.std(w))
+    return mid + n_std * sd, mid - n_std * sd, mid
+
+
+def max_drawdown_pct_series(prices):
+    if prices.size < 2:
+        return None
+    peak = np.maximum.accumulate(prices)
+    dd = np.where(peak > 0, (peak - prices) / peak, 0.0)
+    return float(np.max(dd) * 100.0)
+
+
+def realized_vol_annual_pct(prices):
+    if prices.size < 16:
+        return None
+    lr = np.diff(np.log(prices))
+    # Órás sávok: évesítés ~ sqrt(252 * 24)
+    return float(np.std(lr) * np.sqrt(252.0 * 24.0) * 100.0)
+
+
+def volume_stats(volumes):
+    if volumes is None or volumes.size == 0:
+        return None, None, None
+    clean = volumes[~np.isnan(volumes)]
+    if clean.size == 0:
+        return None, None, None
+    last_v = float(clean[-1])
+    w = min(20, clean.size)
+    sma_v = float(np.mean(clean[-w:]))
+    ratio = (last_v / sma_v) if sma_v > 0 else None
+    return last_v, sma_v, ratio
+
+
+def build_extended_metrics(prices, volumes):
+    m, s, h = macd_bundle(prices)
+    bu, bl, bm = bollinger_last(prices)
+    lv, sv, rr = volume_stats(volumes)
+    return {
+        "macd_line": m,
+        "macd_signal": s,
+        "macd_hist": h,
+        "bb_upper": bu,
+        "bb_lower": bl,
+        "bb_mid": bm,
+        "volume_last": lv,
+        "volume_sma20": sv,
+        "volume_vs_sma": rr,
+        "max_drawdown_pct": max_drawdown_pct_series(prices),
+        "realized_vol_annual_pct": realized_vol_annual_pct(prices),
+    }
+
+
+def correlation_matrix_log_returns(asset_items, rate, display_currency, timeout=REQUEST_TIMEOUT):
+    series = []
+    names = []
+    min_len = None
+    for name, sym in asset_items:
+        try:
+            p, _, _, _ = get_asset(sym, timeout=timeout)
+            mult = yahoo_price_display_multiplier(sym, rate, display_currency)
+            a = p * mult
+            lr = np.diff(np.log(a))
+            if lr.size < 5:
+                continue
+            series.append(lr)
+            names.append(name)
+            min_len = lr.size if min_len is None else min(min_len, lr.size)
+        except (requests.RequestException, ValueError, KeyError):
+            continue
+    if len(series) < 2 or min_len is None or min_len < 5:
+        return None, names
+    n = len(series)
+    mat = np.eye(n, dtype=float)
+    for i in range(n):
+        for j in range(i + 1, n):
+            xi = series[i][-min_len:]
+            xj = series[j][-min_len:]
+            c = float(np.corrcoef(xi, xj)[0, 1])
+            if np.isnan(c):
+                c = 0.0
+            mat[i, j] = mat[j, i] = c
+    return mat, names
+
+
+def fetch_yahoo_headlines(symbol, limit=8, timeout=REQUEST_TIMEOUT):
+    from urllib.parse import quote
+
+    q = quote(str(symbol), safe="")
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={q}&region=US&lang=en-US"
+    try:
+        r = http_get(url, timeout=timeout, headers=YAHOO_HEADERS)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        out = []
+        for it in root.findall(".//item"):
+            if len(out) >= limit:
+                break
+            t = (it.findtext("title") or "").strip()
+            link = (it.findtext("link") or "").strip()
+            if t:
+                out.append({"title": t, "link": link})
+        return out
+    except (requests.RequestException, ET.ParseError, ValueError):
+        return []
+
+
+def format_correlation_table(mat, names):
+    if mat is None or not names or mat.shape[0] != len(names):
+        return "Nincs eleg adat a korrelaciohoz (legalabb 2 eszkoz, sikeres letoltes)."
+    lines = ["Korrelacio (log-hozam, kozos idosor vege)", ""]
+    header = " " * 14 + "".join(f"{n[:10]:>12}" for n in names)
+    lines.append(header)
+    for i, row_name in enumerate(names):
+        row = f"{row_name[:12]:14}"
+        for j in range(len(names)):
+            row += f"{mat[i, j]:12.2f}"
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def build_html_report(results, currency, title="AI Eszkoz riport"):
+    esc = html.escape
+    parts = [
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/>",
+        f"<title>{esc(title)}</title>",
+        "<style>body{font-family:system-ui;background:#111827;color:#e5e7eb;padding:24px;}",
+        "h2{color:#93c5fd;} table{border-collapse:collapse;width:100%;margin:12px 0;}",
+        "td,th{border:1px solid #374151;padding:8px;text-align:left;}</style></head><body>",
+        f"<h1>{esc(title)}</h1>",
+        f"<p>Deviza: {esc(currency)}</p>",
+    ]
+    for r in results:
+        rec = r.get("recommendation") or {}
+        parts.append(f"<h2>{esc(str(r.get('name','')))}</h2>")
+        parts.append("<table>")
+        for label, key in [
+            ("Ar", "current"),
+            ("AI celar", "future"),
+            ("RSI", "rsi"),
+            ("Dontes", "decision"),
+        ]:
+            if key in r:
+                parts.append(f"<tr><th>{esc(label)}</th><td>{esc(str(r[key]))}</td></tr>")
+        if rec:
+            parts.append(f"<tr><th>Ajanlas</th><td>{esc(str(rec.get('action','')))}</td></tr>")
+        parts.append("</table><hr/>")
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def custom_rule_matches(rule, result):
+    target = str(rule.get("asset", "*")).strip()
+    if target != "*" and target != result.get("name"):
+        return False
+    kind = str(rule.get("rule", "")).strip()
+    try:
+        val = float(rule.get("value"))
+    except (TypeError, ValueError):
+        return False
+    cur = float(result["current"])
+    rsi = float(result["rsi"])
+    if kind == "price_above":
+        return cur >= val
+    if kind == "price_below":
+        return cur <= val
+    if kind == "rsi_above":
+        return rsi >= val
+    if kind == "rsi_below":
+        return rsi <= val
+    return False
+
+
+def fire_custom_rules_if_needed(rules, result, cooldown_until, cooldown_sec=180):
+    """cooldown_until: dict rule_key -> epoch when ok to fire again"""
+    import time
+
+    now = time.time()
+    msgs = []
+    for rule in rules:
+        key = f"{rule.get('asset')}|{rule.get('rule')}|{rule.get('value')}"
+        if not custom_rule_matches(rule, result):
+            continue
+        until = float(cooldown_until.get(key, 0))
+        if now < until:
+            continue
+        cooldown_until[key] = now + cooldown_sec
+        msgs.append(
+            f"Szabaly [{rule.get('rule')} {rule.get('value')}] — {result.get('name')}: "
+            f"RSI {result.get('rsi'):.1f}, ar {result.get('current'):.2f}"
+        )
+    return msgs
 
 
 # ---- RSI (Wilder simítás) ----
@@ -544,7 +1028,8 @@ def evaluate_today_investment(amount, currency, has_real_huf_rate, fx_ctx, resul
 
 def analyze_asset(name, symbol, rate, display_currency="HUF"):
     mult = yahoo_price_display_multiplier(symbol, rate, display_currency)
-    prices = get_asset(symbol) * mult
+    prices_raw, meta, open_fallback_native, volumes_raw = get_asset(symbol)
+    prices = prices_raw * mult
     decision, current, future, rsi, ma, next_up_prob, accuracy = smart_decision(prices)
     recommendation = build_recommendation(
         current=current,
@@ -554,8 +1039,13 @@ def analyze_asset(name, symbol, rate, display_currency="HUF"):
         rsi=rsi,
         ma=ma,
     )
+    session_open, previous_close = meta_session_open_previous_close(
+        meta, mult, native_open_fallback=open_fallback_native
+    )
+    metrics = build_extended_metrics(prices, volumes_raw)
     return {
         "name": name,
+        "symbol": symbol,
         "current": current,
         "future": future,
         "rsi": rsi,
@@ -564,11 +1054,15 @@ def analyze_asset(name, symbol, rate, display_currency="HUF"):
         "next_up_prob": next_up_prob,
         "accuracy": accuracy,
         "recommendation": recommendation,
+        "day_change_pct": regular_market_change_pct(meta),
+        "session_open": session_open,
+        "previous_close": previous_close,
+        "metrics": metrics,
     }
 
 
 def get_current_price(symbol, rate, display_currency="HUF"):
-    prices = get_asset(symbol)
+    prices, _, _, _ = get_asset(symbol)
     mult = yahoo_price_display_multiplier(symbol, rate, display_currency)
     return float(prices[-1] * mult)
 
@@ -642,6 +1136,12 @@ def get_ai_commentary(result, currency, api_key, model=OPENAI_MODEL_DEFAULT, tim
         "Adj rovid, 3-5 pontos magyar piaci osszefoglalot ezek alapjan. "
         "Ne adj befektetesi garanciat, legyen ovatos hangnem.\n\n"
         f"Eszkoz: {result.get('name')}\n"
+    )
+    if result.get("session_open") is not None:
+        prompt += f"Mai nyitas: {float(result['session_open']):.2f} {currency}\n"
+    if result.get("previous_close") is not None:
+        prompt += f"Elozo zaro: {float(result['previous_close']):.2f} {currency}\n"
+    prompt += (
         f"Most: {result.get('current'):.2f} {currency}\n"
         f"AI celar (1 ora): {result.get('future'):.2f} {currency}\n"
         f"AI fel esely: {result.get('next_up_prob', 0.0) * 100:.1f}%\n"
@@ -743,12 +1243,43 @@ def monitor_price_changes(selected_assets, interval_sec=60, threshold_pct=1.0):
 def format_result(result, currency="HUF"):
     rec = result["recommendation"]
     text = f"{result['name']}\n"
+    dcp = result.get("day_change_pct")
+    if dcp is not None:
+        text += f"Napi / regular piaci valtozas: {dcp:+.2f}%\n"
+    so = result.get("session_open")
+    pzc = result.get("previous_close")
+    if so is not None:
+        text += f"Mai / aktuális session nyitás: {int(so):,} {currency}\n"
+    if pzc is not None:
+        text += f"Előző záró: {int(pzc):,} {currency}\n"
     text += f"Most: {int(result['current']):,} {currency}\n"
     text += f"AI célár (1 óra): {int(result['future']):,} {currency}\n"
     text += f"AI esély fel: {result['next_up_prob'] * 100:.1f}%\n"
     text += f"AI validáció pontosság: {result['accuracy'] * 100:.1f}%\n"
     text += f"RSI: {result['rsi']:.2f}\n"
     text += f"MA: {int(result['ma']):,}\n"
+    m = result.get("metrics") or {}
+    if m:
+        text += "Indikatorok / kockazat (90 napos oras sav):\n"
+        if m.get("macd_hist") is not None:
+            text += (
+                f"- MACD: vonal {m['macd_line']:.4f}, jel {m['macd_signal']:.4f}, "
+                f"histogram {m['macd_hist']:.4f}\n"
+            )
+        if m.get("bb_mid") is not None:
+            text += (
+                f"- Bollinger (20, 2σ): fel {m['bb_upper']:.2f}, kozep {m['bb_mid']:.2f}, "
+                f"al {m['bb_lower']:.2f}\n"
+            )
+        vl, vr = m.get("volume_last"), m.get("volume_vs_sma")
+        if vl is not None and vl > 0 and vr is not None:
+            text += f"- Forgalom: utolso {vl:,.0f}, arany 20-as atlaghoz: {vr:.2f}x\n"
+        elif vl is not None and vl > 0:
+            text += f"- Forgalom (utolso sav): {vl:,.0f}\n"
+        if m.get("realized_vol_annual_pct") is not None:
+            text += f"- Realizalt volatilitas (evesitett, kb): {m['realized_vol_annual_pct']:.1f}%\n"
+        if m.get("max_drawdown_pct") is not None:
+            text += f"- Max. visszaeses (idosoron): {m['max_drawdown_pct']:.2f}%\n"
     text += f"Döntés: {result['decision']}\n"
     text += "Ajánlás:\n"
     text += f"- Irány: {rec['action']} ({rec['side']})\n"
@@ -778,7 +1309,7 @@ if QT_AVAILABLE:
         def __init__(self):
             super().__init__()
             self.setWindowTitle("AI Eszkozelemzo Pro")
-            self.setGeometry(100, 100, 1220, 700)
+            self.setGeometry(100, 100, 1280, 780)
             self.apply_styles()
             self.invest_amount = None
             self.live_interval_sec = 30
@@ -796,10 +1327,38 @@ if QT_AVAILABLE:
             self.last_prices_live = {}
             self.live_timer = QTimer(self)
             self.live_timer.timeout.connect(self.run_live_tick)
+            self.favorite_names = set(load_favorites())
+            self.custom_rules = load_custom_alert_rules()
+            self._rule_cooldown = {}
+            self._last_results = []
+            self._last_scheduled_run_date = None
 
             layout = QHBoxLayout()
             layout.setContentsMargins(14, 14, 14, 14)
             layout.setSpacing(12)
+
+            left_col = QVBoxLayout()
+            self.asset_search = QLineEdit()
+            self.asset_search.setPlaceholderText("Keresés eszköz névre…")
+            self.asset_search.textChanged.connect(self.filter_asset_list)
+            left_col.addWidget(self.asset_search)
+
+            fav_row = QHBoxLayout()
+            self.cb_favorites_only = QCheckBox("Csak kedvencek")
+            self.cb_favorites_only.toggled.connect(self.on_favorites_filter_toggled)
+            fav_row.addWidget(self.cb_favorites_only)
+            self.btn_fav_toggle = QPushButton("Kedvenc ☆ váltás")
+            self.btn_fav_toggle.clicked.connect(self.toggle_favorite_selection)
+            fav_row.addWidget(self.btn_fav_toggle)
+            left_col.addLayout(fav_row)
+
+            cur_row = QHBoxLayout()
+            cur_row.addWidget(QLabel("Megjelenítés:"))
+            self.currency_combo = QComboBox()
+            self.currency_combo.addItems(["Auto (HUF ha elérhető)", "Mindig USD"])
+            self.currency_combo.currentIndexChanged.connect(self.on_display_currency_changed)
+            cur_row.addWidget(self.currency_combo, 1)
+            left_col.addLayout(cur_row)
 
             self.list_widget = QListWidget()
             self.list_widget.setSelectionMode(
@@ -809,8 +1368,10 @@ if QT_AVAILABLE:
                 self.list_widget.addItem(name)
             self.list_widget.setCurrentRow(0)
             self.list_widget.setMinimumWidth(280)
-
-            layout.addWidget(self.list_widget)
+            left_col.addWidget(self.list_widget, 1)
+            left_panel = QWidget()
+            left_panel.setLayout(left_col)
+            layout.addWidget(left_panel)
 
             right = QVBoxLayout()
             right.setSpacing(10)
@@ -847,12 +1408,54 @@ if QT_AVAILABLE:
 
             analysis_tab = QWidget()
             analysis_layout = QVBoxLayout()
+            out_row = QHBoxLayout()
+            self.btn_copy_output = QPushButton("Kimenet vágólapra")
+            self.btn_copy_output.clicked.connect(self.copy_output_to_clipboard)
+            out_row.addWidget(self.btn_copy_output)
+            out_row.addStretch(1)
+            analysis_layout.addLayout(out_row)
             self.output = QTextEdit()
             self.output.setReadOnly(True)
             self.output.setPlaceholderText("Az elemzes eredmenye itt fog megjelenni...")
             analysis_layout.addWidget(self.output)
             analysis_tab.setLayout(analysis_layout)
             self.tabs.addTab(analysis_tab, "Elemzes")
+
+            chart_tab = QWidget()
+            chart_outer = QVBoxLayout()
+            self._chart_range = ("1d", "5m")
+            chart_btn_row = QHBoxLayout()
+            self.chart_range_specs = [
+                ("1 nap (élő)", "1d", "5m"),
+                ("5 nap", "5d", "15m"),
+                ("1 hó", "1mo", "1h"),
+                ("3 hó", "3mo", "1d"),
+            ]
+            for label, rng, iv in self.chart_range_specs:
+
+                def _make_chart_handler(r, i):
+                    return lambda: self.set_chart_interval(r, i)
+
+                b = QPushButton(label)
+                b.clicked.connect(_make_chart_handler(rng, iv))
+                chart_btn_row.addWidget(b)
+            chart_btn_row.addStretch(1)
+            chart_outer.addLayout(chart_btn_row)
+            self.cb_compare_chart = QCheckBox("2 eszköz összehasonlítás (index 100 = indulás)")
+            self.cb_compare_chart.toggled.connect(self.refresh_price_chart)
+            chart_outer.addWidget(self.cb_compare_chart)
+            self.cb_bb_chart = QCheckBox("Bollinger sávok (ha elég adatpont)")
+            self.cb_bb_chart.toggled.connect(self.refresh_price_chart)
+            chart_outer.addWidget(self.cb_bb_chart)
+            self.chart_subtitle = QLabel("Válassz eszközt; az első kijelölt sor árfolyama jelenik meg.")
+            self.chart_subtitle.setWordWrap(True)
+            chart_outer.addWidget(self.chart_subtitle)
+            self.chart_view = QChartView()
+            self.chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self.chart_view.setMinimumHeight(320)
+            chart_outer.addWidget(self.chart_view, 1)
+            chart_tab.setLayout(chart_outer)
+            self.tabs.addTab(chart_tab, "Árfolyam diagram")
 
             alerts_tab = QWidget()
             alerts_layout = QVBoxLayout()
@@ -874,6 +1477,48 @@ if QT_AVAILABLE:
             portfolio_layout.addWidget(self.portfolio_output)
             portfolio_tab.setLayout(portfolio_layout)
             self.tabs.addTab(portfolio_tab, "Portfolio")
+
+            corr_tab = QWidget()
+            corr_layout = QVBoxLayout()
+            self.btn_correlation = QPushButton("Korreláció frissítése (kijelölt eszközök)")
+            self.btn_correlation.clicked.connect(self.refresh_correlation_view)
+            corr_layout.addWidget(self.btn_correlation)
+            self.corr_output = QTextEdit()
+            self.corr_output.setReadOnly(True)
+            self.corr_output.setPlaceholderText("Log-hozam korrelációs mátrix…")
+            corr_layout.addWidget(self.corr_output)
+            corr_tab.setLayout(corr_layout)
+            self.tabs.addTab(corr_tab, "Korreláció")
+
+            hist_tab = QWidget()
+            hist_layout = QVBoxLayout()
+            hist_row = QHBoxLayout()
+            self.history_filter = QLineEdit()
+            self.history_filter.setPlaceholderText("Szűrés eszköz névre…")
+            self.btn_history_load = QPushButton("Előzmények betöltése (SQLite)")
+            self.btn_history_load.clicked.connect(self.load_history_table)
+            hist_row.addWidget(self.history_filter)
+            hist_row.addWidget(self.btn_history_load)
+            hist_layout.addLayout(hist_row)
+            self.history_table = QTableWidget()
+            self.history_table.setColumnCount(9)
+            self.history_table.setHorizontalHeaderLabels(
+                ["Idő", "Eszköz", "Dev", "Most", "Célár", "Döntés", "RSI", "AI fel %", "Pontosság"]
+            )
+            hist_layout.addWidget(self.history_table)
+            hist_tab.setLayout(hist_layout)
+            self.tabs.addTab(hist_tab, "Előzmények")
+
+            news_tab = QWidget()
+            news_layout = QVBoxLayout()
+            self.btn_news = QPushButton("Yahoo hírcsatorna (első kijelölt)")
+            self.btn_news.clicked.connect(self.load_news_for_selection)
+            news_layout.addWidget(self.btn_news)
+            self.news_output = QTextEdit()
+            self.news_output.setReadOnly(True)
+            news_layout.addWidget(self.news_output)
+            news_tab.setLayout(news_layout)
+            self.tabs.addTab(news_tab, "Hírek")
 
             settings_tab = QWidget()
             settings_layout = QVBoxLayout()
@@ -919,6 +1564,26 @@ if QT_AVAILABLE:
             self.ai_status = QLabel("AI: kikapcsolva")
             settings_layout.addWidget(self.ai_status)
 
+            self.btn_export_html = QPushButton("HTML riport mentése…")
+            self.btn_export_html.clicked.connect(self.export_html_report)
+            settings_layout.addWidget(self.btn_export_html)
+
+            self.btn_edit_alert_rules = QPushButton("Egyedi ár/RSI szabályok (JSON)…")
+            self.btn_edit_alert_rules.clicked.connect(self.edit_alert_rules_dialog)
+            settings_layout.addWidget(self.btn_edit_alert_rules)
+
+            sched_row = QHBoxLayout()
+            self.cb_schedule_analysis = QCheckBox("Napi ütemezett elemzés:")
+            self.time_schedule = QTimeEdit()
+            self.time_schedule.setDisplayFormat("HH:mm")
+            self.time_schedule.setTime(QTime(9, 0))
+            sched_row.addWidget(self.cb_schedule_analysis)
+            sched_row.addWidget(self.time_schedule)
+            settings_layout.addLayout(sched_row)
+            self.schedule_timer = QTimer(self)
+            self.schedule_timer.timeout.connect(self.schedule_tick)
+            self.schedule_timer.start(30_000)
+
             settings_layout.addStretch(1)
             settings_tab.setLayout(settings_layout)
             self.tabs.addTab(settings_tab, "Beallitasok")
@@ -947,9 +1612,11 @@ if QT_AVAILABLE:
             layout.addLayout(right)
             self.setLayout(layout)
             self.list_widget.itemSelectionChanged.connect(self.update_selected_count)
+            self.list_widget.itemSelectionChanged.connect(self.refresh_price_chart)
             self.update_selected_count()
             self.refresh_telegram_status()
             self.refresh_ai_status()
+            self.refresh_price_chart()
 
         def apply_styles(self):
             self.setStyleSheet(
@@ -1008,11 +1675,386 @@ if QT_AVAILABLE:
                     font-size: 13px;
                     color: #e5e7eb;
                 }
+                QComboBox, QTimeEdit {
+                    background-color: #1f2937;
+                    color: #e5e7eb;
+                    border: 1px solid #374151;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                }
+                QTableWidget {
+                    background-color: #1f2937;
+                    gridline-color: #374151;
+                    border: 1px solid #374151;
+                    border-radius: 8px;
+                }
+                QHeaderView::section {
+                    background-color: #111827;
+                    color: #f3f4f6;
+                    padding: 6px;
+                    border: 1px solid #374151;
+                }
                 """
             )
 
+        def resolve_rate_currency(self):
+            if self.currency_combo.currentIndex() == 1:
+                return 1.0, "USD", "Kézi USD megjelenítés"
+            return get_effective_rate()
+
+        def on_display_currency_changed(self, _index=None):
+            self.refresh_price_chart()
+
+        def on_favorites_filter_toggled(self, _checked=False):
+            self.filter_asset_list(self.asset_search.text())
+
+        def toggle_favorite_selection(self):
+            for it in self.list_widget.selectedItems():
+                n = it.text()
+                if n in self.favorite_names:
+                    self.favorite_names.discard(n)
+                else:
+                    self.favorite_names.add(n)
+            save_favorites(sorted(self.favorite_names))
+            self.log_alert(f"Kedvencek frissítve: {len(self.favorite_names)} db")
+
+        def schedule_tick(self):
+            if not self.cb_schedule_analysis.isChecked():
+                return
+            if self.invest_amount is None:
+                return
+            now = QDateTime.currentDateTime()
+            tt = self.time_schedule.time()
+            if now.time().hour() != tt.hour() or now.time().minute() != tt.minute():
+                return
+            dkey = now.toString("yyyy-MM-dd")
+            if self._last_scheduled_run_date == dkey:
+                return
+            self._last_scheduled_run_date = dkey
+            self.log_alert(f"Ütemezett elemzés: {dkey} {tt.toString('HH:mm')}")
+            self.run_analysis(prompt_amount=False)
+
+        def edit_alert_rules_dialog(self):
+            raw = json.dumps(self.custom_rules, ensure_ascii=False, indent=2)
+            txt, ok = QInputDialog.getMultiLineText(
+                self,
+                "Egyedi riasztási szabályok",
+                'JSON lista. Mezők: asset (vagy "*"), rule: price_above|price_below|rsi_above|rsi_below, value (szám).\n'
+                "Példa: [{\"asset\": \"Apple\", \"rule\": \"rsi_below\", \"value\": 30}]",
+                raw,
+            )
+            if not ok:
+                return
+            try:
+                data = json.loads(txt)
+                if not isinstance(data, list):
+                    raise ValueError("A gyökérnek listanek kell lennie.")
+                self.custom_rules = data
+                save_custom_alert_rules(data)
+                self.log_alert("Riasztási szabályok elmentve.")
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
+                self.log_alert(f"Szabály JSON hiba: {e}")
+
+        def export_html_report(self):
+            if not self._last_results:
+                self.log_alert("Nincs mit menteni — futtass előbb elemzést.")
+                return
+            path, _sel = QFileDialog.getSaveFileName(
+                self,
+                "HTML riport",
+                str(Path.home() / "ai_tracker_riport.html"),
+                "HTML (*.html)",
+            )
+            if not path:
+                return
+            _, cur, _ = self.resolve_rate_currency()
+            doc = build_html_report(self._last_results, cur)
+            try:
+                Path(path).write_text(doc, encoding="utf-8")
+                self.log_alert(f"HTML mentve: {path}")
+            except OSError as e:
+                self.log_alert(f"HTML mentési hiba: {e}")
+
+        def refresh_correlation_view(self):
+            items = self.selected_asset_items()
+            rate, cur, rw = self.resolve_rate_currency()
+            mat, names = correlation_matrix_log_returns(items, rate, cur)
+            txt = format_correlation_table(mat, names)
+            if rw:
+                txt += f"\n\nMegjegyzés: {rw}"
+            self.corr_output.setPlainText(txt)
+
+        def load_history_table(self):
+            needle = self.history_filter.text().strip()
+            rows = db_search_history(needle, limit=500)
+            self.history_table.setRowCount(len(rows))
+            for i, row in enumerate(rows):
+                for j, val in enumerate(row):
+                    disp = "" if val is None else str(val)
+                    self.history_table.setItem(i, j, QTableWidgetItem(disp))
+
+        def load_news_for_selection(self):
+            name, sym = self.chart_target_symbol()
+            if not sym:
+                self.news_output.setPlainText("Válassz eszközt a listában.")
+                return
+            items = fetch_yahoo_headlines(sym, limit=12)
+            if not items:
+                self.news_output.setPlainText(
+                    f"Nincs hír, vagy az RSS nem elérhető ({sym}). Próbáld újra később."
+                )
+                return
+            lines = [f"{name} ({sym})", ""]
+            for it in items:
+                lines.append(it.get("title", ""))
+                if it.get("link"):
+                    lines.append(f"  {it['link']}")
+                lines.append("")
+            self.news_output.setPlainText("\n".join(lines))
+
         def select_all_assets(self):
             self.list_widget.selectAll()
+
+        def filter_asset_list(self, text):
+            needle = (text or "").strip().lower()
+            selected_names = {i.text() for i in self.list_widget.selectedItems()}
+            self.list_widget.clear()
+            for name in ASSETS:
+                if self.cb_favorites_only.isChecked() and name not in self.favorite_names:
+                    continue
+                if not needle or needle in name.lower():
+                    self.list_widget.addItem(name)
+            for i in range(self.list_widget.count()):
+                it = self.list_widget.item(i)
+                if it.text() in selected_names:
+                    it.setSelected(True)
+            self.update_selected_count()
+
+        def copy_output_to_clipboard(self):
+            QApplication.clipboard().setText(self.output.toPlainText())
+
+        def set_chart_interval(self, rng, interval):
+            self._chart_range = (rng, interval)
+            self.refresh_price_chart()
+
+        def chart_target_symbol(self):
+            names = [i.text() for i in self.list_widget.selectedItems()]
+            if names:
+                n = names[0]
+                return n, ASSETS.get(n)
+            row = self.list_widget.currentRow()
+            if row >= 0:
+                it = self.list_widget.item(row)
+                if it:
+                    n = it.text()
+                    return n, ASSETS.get(n)
+            return None, None
+
+        def refresh_price_chart(self):
+            empty = QChart()
+            rng, interval = self._chart_range
+
+            def _x_format(r):
+                if r == "1d":
+                    return "HH:mm"
+                if r == "5d":
+                    return "ddd HH:mm"
+                if r == "1mo":
+                    return "d MMM"
+                return "yyyy-MM-dd"
+
+            try:
+                rate, currency, rate_warning = self.resolve_rate_currency()
+                fx_note = f" FX: {rate_warning}" if rate_warning else ""
+
+                if self.cb_compare_chart.isChecked():
+                    sel = [i.text() for i in self.list_widget.selectedItems()]
+                    if len(sel) < 2:
+                        self.chart_view.setChart(empty)
+                        self.chart_subtitle.setText(
+                            "Összehasonlításhoz jelölj ki legalább két eszközt a listában."
+                        )
+                        return
+                    n1, s1 = sel[0], ASSETS[sel[0]]
+                    n2, s2 = sel[1], ASSETS[sel[1]]
+                    m1 = yahoo_price_display_multiplier(s1, rate, currency)
+                    m2 = yahoo_price_display_multiplier(s2, rate, currency)
+                    snap1 = fetch_chart_series(s1, rng, interval)
+                    snap2 = fetch_chart_series(s2, rng, interval)
+                    d1 = {int(t): float(p) * m1 for t, p in snap1["points"]}
+                    d2 = {int(t): float(p) * m2 for t, p in snap2["points"]}
+                    common = sorted(set(d1.keys()) & set(d2.keys()))
+                    if len(common) < 2:
+                        self.chart_view.setChart(empty)
+                        self.chart_subtitle.setText("Nincs elég közös időbélyeg a két eszközhöz.")
+                        return
+                    base1 = d1[common[0]]
+                    base2 = d2[common[0]]
+                    if base1 == 0 or base2 == 0:
+                        self.chart_view.setChart(empty)
+                        self.chart_subtitle.setText("Nulla bázisár — nem rajzolható index.")
+                        return
+                    ser1 = QLineSeries()
+                    ser1.setName(n1[:18])
+                    ser2 = QLineSeries()
+                    ser2.setName(n2[:18])
+                    for t in common:
+                        ser1.append(float(t), 100.0 * d1[t] / base1)
+                        ser2.append(float(t), 100.0 * d2[t] / base2)
+                    p1 = QPen(QColor("#22c55e"))
+                    p1.setWidthF(2.0)
+                    ser1.setPen(p1)
+                    p2 = QPen(QColor("#38bdf8"))
+                    p2.setWidthF(2.0)
+                    ser2.setPen(p2)
+                    chart = QChart()
+                    chart.addSeries(ser1)
+                    chart.addSeries(ser2)
+                    chart.legend().setVisible(True)
+                    chart.setBackgroundBrush(QBrush(QColor("#1f2937")))
+                    chart.setTitleBrush(QBrush(QColor("#f3f4f6")))
+                    chart.setPlotAreaBackgroundVisible(True)
+                    chart.setPlotAreaBackgroundBrush(QBrush(QColor("#111827")))
+                    chart.setTitle(f"Relatív teljesítmény (100 = első közös pont) — {currency}")
+                    dt_min = QDateTime.fromMSecsSinceEpoch(int(common[0]))
+                    dt_max = QDateTime.fromMSecsSinceEpoch(int(common[-1]))
+                    axis_x = QDateTimeAxis()
+                    axis_x.setFormat(_x_format(rng))
+                    axis_x.setTitleText("Idő")
+                    axis_x.setRange(dt_min, dt_max)
+                    axis_y = QValueAxis()
+                    axis_y.setTitleText("Index")
+                    axis_y.setLabelFormat("%.1f")
+                    vals = [100.0 * d1[t] / base1 for t in common] + [
+                        100.0 * d2[t] / base2 for t in common
+                    ]
+                    ymin, ymax = min(vals), max(vals)
+                    pad = (ymax - ymin) * 0.08 if ymax > ymin else 1.0
+                    axis_y.setRange(ymin - pad, ymax + pad)
+                    chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+                    chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+                    ser1.attachAxis(axis_x)
+                    ser1.attachAxis(axis_y)
+                    ser2.attachAxis(axis_x)
+                    ser2.attachAxis(axis_y)
+                    self.chart_view.setChart(chart)
+                    self.chart_subtitle.setText(
+                        f"{n1} vs {n2} | {rng}/{interval}. Élő módban frissül.{fx_note}"
+                    )
+                    return
+
+                name, symbol = self.chart_target_symbol()
+                if not symbol or not name:
+                    self.chart_view.setChart(empty)
+                    self.chart_subtitle.setText(
+                        "Válassz eszközt; az első kijelölt sor árfolyama jelenik meg."
+                    )
+                    return
+
+                mult = yahoo_price_display_multiplier(symbol, rate, currency)
+                snap = fetch_chart_series(symbol, rng, interval)
+                pts = [(t, p * mult) for t, p in snap["points"]]
+                chg = regular_market_change_pct(snap["meta"])
+                sess_o, prev_c = meta_session_open_previous_close(
+                    snap["meta"],
+                    mult,
+                    native_open_fallback=snap.get("native_open_fallback"),
+                )
+                ohlc_bits = []
+                if sess_o is not None:
+                    ohlc_bits.append(f"Nyitás: {sess_o:,.0f} {currency}")
+                if prev_c is not None:
+                    ohlc_bits.append(f"Előző záró: {prev_c:,.0f} {currency}")
+                ohlc_suffix = (" · " + " · ".join(ohlc_bits)) if ohlc_bits else ""
+
+                series = QLineSeries()
+                series.setName("Ár")
+                for t, p in pts:
+                    series.append(float(t), float(p))
+                pen = QPen(QColor("#22c55e"))
+                pen.setWidthF(2.0)
+                series.setPen(pen)
+                chart = QChart()
+                chart.addSeries(series)
+                chart.legend().setVisible(self.cb_bb_chart.isChecked())
+                chart.setBackgroundBrush(QBrush(QColor("#1f2937")))
+                chart.setTitleBrush(QBrush(QColor("#f3f4f6")))
+                chart.setPlotAreaBackgroundVisible(True)
+                chart.setPlotAreaBackgroundBrush(QBrush(QColor("#111827")))
+                title = f"{name} — {currency}"
+                if chg is not None:
+                    title += f" ({chg:+.2f}% vs. előző záró)"
+                chart.setTitle(title)
+                dt_min = QDateTime.fromMSecsSinceEpoch(int(pts[0][0]))
+                dt_max = QDateTime.fromMSecsSinceEpoch(int(pts[-1][0]))
+                axis_x = QDateTimeAxis()
+                axis_x.setFormat(_x_format(rng))
+                axis_x.setTitleText("Idő")
+                axis_x.setRange(dt_min, dt_max)
+                vals = [p for _, p in pts]
+                all_y = list(vals)
+
+                if self.cb_bb_chart.isChecked() and len(pts) >= 21:
+                    arr = np.array([p for _, p in pts], dtype=float)
+                    upper_s = QLineSeries()
+                    lower_s = QLineSeries()
+                    mid_s = QLineSeries()
+                    upper_s.setName("BB fel")
+                    lower_s.setName("BB al")
+                    mid_s.setName("BB közép")
+                    pu = QPen(QColor("#a78bfa"))
+                    pu.setStyle(Qt.PenStyle.DashLine)
+                    pu.setWidthF(1.2)
+                    pl = QPen(QColor("#f472b6"))
+                    pl.setStyle(Qt.PenStyle.DashLine)
+                    pl.setWidthF(1.2)
+                    pm = QPen(QColor("#94a3b8"))
+                    pm.setWidthF(1.0)
+                    upper_s.setPen(pu)
+                    lower_s.setPen(pl)
+                    mid_s.setPen(pm)
+                    for i in range(20, len(pts)):
+                        seg = arr[i - 20 : i + 1]
+                        mu = float(np.mean(seg))
+                        sd = float(np.std(seg))
+                        ts = float(pts[i][0])
+                        upper_s.append(ts, mu + 2.0 * sd)
+                        lower_s.append(ts, mu - 2.0 * sd)
+                        mid_s.append(ts, mu)
+                        all_y.extend([mu + 2.0 * sd, mu - 2.0 * sd, mu])
+                    chart.addSeries(upper_s)
+                    chart.addSeries(lower_s)
+                    chart.addSeries(mid_s)
+
+                ymin, ymax = min(all_y), max(all_y)
+                span = ymax - ymin
+                pad = span * 0.08 if span > 0 else max(abs(ymax) * 0.02, 1e-8)
+                axis_y = QValueAxis()
+                if ymax >= 500:
+                    axis_y.setLabelFormat("%.0f")
+                elif ymax >= 1.0:
+                    axis_y.setLabelFormat("%.2f")
+                else:
+                    axis_y.setLabelFormat("%.4f")
+                axis_y.setRange(ymin - pad, ymax + pad)
+                axis_y.setTitleText(f"Ár ({currency})")
+                chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
+                chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
+                series.attachAxis(axis_x)
+                series.attachAxis(axis_y)
+                if self.cb_bb_chart.isChecked() and len(pts) >= 21:
+                    for s in chart.series():
+                        if s is not series:
+                            s.attachAxis(axis_x)
+                            s.attachAxis(axis_y)
+                self.chart_view.setChart(chart)
+                self.chart_subtitle.setText(
+                    f"Időtáv: {rng} / {interval} — Yahoo Finance.{ohlc_suffix} "
+                    f"Élő módban az elemzéssel együtt frissül.{fx_note}"
+                )
+            except Exception as e:
+                self.chart_view.setChart(empty)
+                self.chart_subtitle.setText(f"Diagram hiba — {e}")
 
         def output_clear(self):
             self.output.clear()
@@ -1211,7 +2253,7 @@ if QT_AVAILABLE:
             self.portfolio_output.setPlainText("\n".join(lines))
 
         def set_invest_amount(self):
-            rate, currency, _ = get_effective_rate()
+            rate, currency, _ = self.resolve_rate_currency()
             amount, ok = QInputDialog.getDouble(
                 self,
                 "Befektetés",
@@ -1275,9 +2317,12 @@ if QT_AVAILABLE:
             if self.auto_clear_analysis:
                 self.output.clear()
 
-            rate, currency, rate_warning = get_effective_rate()
-            if rate_warning:
-                self.output.append(f"Figyelem: árfolyam hiba, USD módra váltva. ({rate_warning})\n")
+            manual_usd = self.currency_combo.currentIndex() == 1
+            rate, currency, rate_warning = self.resolve_rate_currency()
+            if not manual_usd and rate_warning:
+                self.output.append(
+                    f"Figyelem: árfolyam hiba, USD módra váltva. ({rate_warning})\n"
+                )
 
             if prompt_amount:
                 amount, ok = QInputDialog.getDouble(
@@ -1307,6 +2352,7 @@ if QT_AVAILABLE:
 
             results = []
             csv_rows = []
+            db_batch = []
 
             for name, symbol in self.selected_asset_items():
                 try:
@@ -1319,6 +2365,11 @@ if QT_AVAILABLE:
                         result,
                     )
                     results.append(result)
+                    for msg in fire_custom_rules_if_needed(
+                        self.custom_rules, result, self._rule_cooldown
+                    ):
+                        self.log_alert(msg)
+                        self.trigger_alert_channels(msg)
                     self.output.append(format_result(result, currency=currency) + "\n")
                     if self.ai_commentary_enabled and self.ai_api_key:
                         ai_text, ai_err = get_ai_commentary(
@@ -1347,6 +2398,23 @@ if QT_AVAILABLE:
                             "deploy_frac": f"{float(result['investment']['deploy_frac']):.6f}",
                         }
                     )
+                    met = result.get("metrics") or {}
+                    db_batch.append(
+                        (
+                            now_text,
+                            name,
+                            currency,
+                            float(result["current"]),
+                            float(result["future"]),
+                            str(result["decision"]),
+                            float(result["rsi"]),
+                            float(result["next_up_prob"]),
+                            float(result["accuracy"]),
+                            met.get("macd_hist"),
+                            met.get("realized_vol_annual_pct"),
+                            met.get("max_drawdown_pct"),
+                        )
+                    )
 
                     current = float(result["current"])
                     prev = self.last_prices_live.get(name)
@@ -1364,6 +2432,7 @@ if QT_AVAILABLE:
                 except (requests.RequestException, ValueError, KeyError) as e:
                     self.output.append(f"{name}: hiba — {e}\n\n")
             if results:
+                self._last_results = results
                 self.update_decision_stats(results)
                 self.update_portfolio_tab(results, currency)
                 if self.live_timer.isActive() and self.csv_autosave_enabled:
@@ -1371,6 +2440,11 @@ if QT_AVAILABLE:
                         append_live_csv(self.csv_path, csv_rows)
                     except Exception as e:
                         self.log_alert(f"CSV mentesi hiba: {e}")
+                try:
+                    db_insert_rows(db_batch)
+                except Exception as e:
+                    self.log_alert(f"SQLite mentési hiba: {e}")
+            self.refresh_price_chart()
 
 
 def prompt_invest_amount(currency):
