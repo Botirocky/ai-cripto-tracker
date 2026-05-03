@@ -56,6 +56,7 @@ except Exception as e:
     QT_IMPORT_ERROR = e
 
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
 
 # ---- ESZKÖZÖK ----
 ASSETS = {
@@ -88,7 +89,17 @@ ASSETS = {
     "Tesla": "TSLA",
     "AMD": "AMD",
     "Netflix": "NFLX",
+    # Magyar részvények (BÉT, Yahoo: .BD)
+    "OTP Bank": "OTP.BD",
     "MOL": "MOL.BD",
+    "Richter Gedeon": "RICHTER.BD",
+    "Magyar Telekom": "MTEL.BD",
+    "4iG": "4IG.BD",
+    "Opus Global": "OPUS.BD",
+    "Waberer's": "WABERERS.BD",
+    "Masterplast": "MASTERPLAST.BD",
+    "AKKO Invest": "AKKO.BD",
+    "Appeninn": "APPENINN.BD",
 }
 
 FX_URL = "https://api.exchangerate-api.com/v4/latest/USD"
@@ -109,6 +120,18 @@ def http_get(url, timeout=REQUEST_TIMEOUT, headers=None):
             with requests.Session() as session:
                 session.trust_env = False
                 return session.get(url, timeout=timeout, headers=headers)
+        except requests.RequestException:
+            raise first_error
+
+
+def http_post(url, timeout=REQUEST_TIMEOUT, **kwargs):
+    try:
+        return requests.post(url, timeout=timeout, **kwargs)
+    except requests.RequestException as first_error:
+        try:
+            with requests.Session() as session:
+                session.trust_env = False
+                return session.post(url, timeout=timeout, **kwargs)
         except requests.RequestException:
             raise first_error
 
@@ -151,6 +174,25 @@ def get_effective_rate():
         return get_rate(strict=True), "HUF", None
     except Exception as e:
         return 1.0, "USD", str(e)
+
+
+def yahoo_price_display_multiplier(symbol, rate, display_currency):
+    """
+    Yahoo chart: USA részvények és *-USD instrumentumok USD-ben;
+    BÉT (.BD) részvények HUF-ban.
+    rate: 1 USD = rate HUF (get_rate érték).
+    """
+    cur = (display_currency or "HUF").strip().upper()
+    r = float(rate) if rate not in (None, 0) else 1.0
+    if r <= 0:
+        r = 1.0
+    sym = str(symbol or "").strip().upper()
+    is_bet = sym.endswith(".BD")
+    if cur == "HUF":
+        return 1.0 if is_bet else r
+    if is_bet:
+        return 1.0 / r
+    return 1.0
 
 
 def get_usdhuf_vs_ma20(timeout=REQUEST_TIMEOUT):
@@ -283,14 +325,44 @@ def build_features_and_labels(prices):
     return np.array(X, dtype=float), np.array(y, dtype=int)
 
 
+def random_forest_up_probability(model, feature_row):
+    """
+    P(következő óra fel) = osztály 1 valószínűsége.
+    Ha a tanítóhalmaz egy osztályú volt, a predict_proba csak 1 oszlop — a [0][1] index hibát dobna.
+    """
+    row = np.asarray(feature_row, dtype=float).reshape(1, -1)
+    proba = model.predict_proba(row)[0]
+    classes = np.asarray(getattr(model, "classes_", np.arange(len(proba))))
+    if classes.size <= 1:
+        if classes.size == 0:
+            return 0.5
+        return 1.0 if int(classes[0]) == 1 else 0.0
+    idx = np.flatnonzero(classes == 1)
+    if idx.size > 0:
+        return float(proba[int(idx[0])])
+    return float(1.0 - proba[0])
+
+
 def predict(prices):
     X, y = build_features_and_labels(prices)
     if X.shape[0] < 80:
         raise ValueError("Túl kevés minta a tanításhoz.")
 
-    split = int(X.shape[0] * 0.8)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
+    X_train = X_test = y_train = y_test = None
+    uniq, counts = np.unique(y, return_counts=True)
+    can_stratify = uniq.size >= 2 and int(counts.min()) >= 2
+    if can_stratify:
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+        except ValueError:
+            X_train = None
+    if X_train is None:
+        split = int(X.shape[0] * 0.8)
+        split = max(1, min(split, X.shape[0] - 1))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
 
     model = RandomForestClassifier(
         n_estimators=300,
@@ -300,7 +372,7 @@ def predict(prices):
     model.fit(X_train, y_train)
 
     accuracy = float((model.predict(X_test) == y_test).mean()) if y_test.size else 0.0
-    next_up_prob = float(model.predict_proba(X[-1].reshape(1, -1))[0][1])
+    next_up_prob = random_forest_up_probability(model, X[-1])
 
     current = float(prices[-1])
     tail = prices[-49:]
@@ -470,8 +542,9 @@ def evaluate_today_investment(amount, currency, has_real_huf_rate, fx_ctx, resul
     }
 
 
-def analyze_asset(name, symbol, rate):
-    prices = get_asset(symbol) * rate
+def analyze_asset(name, symbol, rate, display_currency="HUF"):
+    mult = yahoo_price_display_multiplier(symbol, rate, display_currency)
+    prices = get_asset(symbol) * mult
     decision, current, future, rsi, ma, next_up_prob, accuracy = smart_decision(prices)
     recommendation = build_recommendation(
         current=current,
@@ -494,9 +567,10 @@ def analyze_asset(name, symbol, rate):
     }
 
 
-def get_current_price(symbol, rate):
+def get_current_price(symbol, rate, display_currency="HUF"):
     prices = get_asset(symbol)
-    return float(prices[-1] * rate)
+    mult = yahoo_price_display_multiplier(symbol, rate, display_currency)
+    return float(prices[-1] * mult)
 
 
 def notify_price_change(title, message):
@@ -590,9 +664,15 @@ def get_ai_commentary(result, currency, api_key, model=OPENAI_MODEL_DEFAULT, tim
         "temperature": 0.4,
     }
     try:
-        r = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
+        r = http_post(OPENAI_API_URL, headers=headers, json=payload, timeout=timeout)
         data = r.json()
+        if r.status_code >= 400:
+            err = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err, dict):
+                msg = err.get("message") or err.get("code") or str(err)
+            else:
+                msg = str(err) if err else r.text or r.reason
+            return None, f"OpenAI API ({r.status_code}): {msg}"
         content = (((data.get("choices") or [None])[0] or {}).get("message") or {}).get("content")
         if not content:
             return None, "Ures AI valasz."
@@ -615,7 +695,7 @@ def monitor_price_changes(selected_assets, interval_sec=60, threshold_pct=1.0):
     had_error = False
     for name, symbol in selected_assets:
         try:
-            current = get_current_price(symbol, rate)
+            current = get_current_price(symbol, rate, currency)
             last_prices[name] = current
             print(f"Kezdő ár — {name}: {current:,.2f} {currency}")
         except (requests.RequestException, ValueError, KeyError) as e:
@@ -636,7 +716,7 @@ def monitor_price_changes(selected_assets, interval_sec=60, threshold_pct=1.0):
                 if name not in last_prices:
                     continue
                 try:
-                    current = get_current_price(symbol, rate)
+                    current = get_current_price(symbol, rate, currency)
                     previous = last_prices[name]
                     if previous == 0:
                         last_prices[name] = current
@@ -1230,7 +1310,7 @@ if QT_AVAILABLE:
 
             for name, symbol in self.selected_asset_items():
                 try:
-                    result = analyze_asset(name, symbol, rate)
+                    result = analyze_asset(name, symbol, rate, currency)
                     result["investment"] = evaluate_today_investment(
                         self.invest_amount,
                         currency,
@@ -1323,7 +1403,7 @@ def run_cli(selected_assets, invest_amount=None):
     had_error = False
     for name, symbol in selected_assets:
         try:
-            result = analyze_asset(name, symbol, rate)
+            result = analyze_asset(name, symbol, rate, currency)
             result["investment"] = evaluate_today_investment(
                 amount,
                 currency,
