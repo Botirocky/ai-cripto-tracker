@@ -1,3 +1,4 @@
+
 # 📊 AI-Powered Crypto & Stock Market Assistant
 
 This project is an AI-driven market monitoring and advisory system designed to track cryptocurrencies and stocks in real time, analyze trends, and provide actionable investment insights.
@@ -54,3 +55,5 @@ pyinstaller ai-cryto-tracker.py
 3. wait for the download ends
 4. open the folder "dist"
 5. run the EXE
+<img width="1337" height="696" alt="kép" src="https://github.com/user-attachments/assets/c420e145-097e-4cec-825a-84623e0029dc" />
+well done!
