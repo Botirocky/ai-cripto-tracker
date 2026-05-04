@@ -56,4 +56,3 @@ pyinstaller ai-cryto-tracker.py
 4. open the folder "dist"
 5. run the EXE
 <img width="1337" height="696" alt="kép" src="https://github.com/user-attachments/assets/c420e145-097e-4cec-825a-84623e0029dc" />
-## Well done!
